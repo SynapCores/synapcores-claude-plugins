@@ -1,0 +1,21 @@
+{
+  "name": "synapcores",
+  "owner": {
+    "name": "SynapCores",
+    "url": "https://synapcores.com"
+  },
+  "metadata": {
+    "description": "SynapCores skills for Claude Code — build on the AI-native database.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "synapcores",
+      "source": "./plugins/synapcores",
+      "description": "Build production apps on SynapCores AIDB (SQL + vectors + Cypher + AGENT_RUN + MCP + native vision). Verified against engine v1.14.0-ce.",
+      "version": "0.1.0",
+      "author": { "name": "SynapCores", "url": "https://synapcores.com" },
+      "keywords": ["synapcores", "aidb", "ai-database", "sql", "vector", "cypher", "rag", "agent-run", "mcp", "vision"]
+    }
+  ]
+}

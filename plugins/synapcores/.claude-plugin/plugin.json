@@ -1,0 +1,10 @@
+{
+  "name": "synapcores",
+  "version": "0.1.0",
+  "description": "Build production apps on SynapCores AIDB — an AI-native database that unifies SQL, vector search, a Cypher graph, LLM completion, an in-database agentic loop (AGENT_RUN), durable agents, native image description, and MCP on one engine. Ships the build-with-synapcores skill, verified against engine v1.14.0-ce.",
+  "author": { "name": "SynapCores", "url": "https://synapcores.com" },
+  "homepage": "https://synapcores.com",
+  "repository": "https://github.com/SynapCores/synapcores-claude-plugins",
+  "license": "Apache-2.0",
+  "keywords": ["synapcores", "aidb", "ai-database", "sql", "vector", "cypher", "rag", "agent-run", "mcp", "vision"]
+}
