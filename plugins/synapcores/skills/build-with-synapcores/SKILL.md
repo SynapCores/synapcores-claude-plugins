@@ -6,7 +6,10 @@ description: >-
   actually expose — plain SQL, graph (Cypher), NL→SQL, transactions,
   recipes, schema introspection, filesystem RAG, vector search, agent
   memory (MEMORY_*), the agentic SQL function AGENT_RUN, durable agents
-  (CREATE AGENT), and streaming chat. Shows production-ready patterns:
+  (CREATE AGENT), streaming chat, durable ACID transactions with enforced
+  FOREIGN KEYs, the MySQL-to-Parquet/S3 data lake with external tables, and
+  AutoML across 32 algorithms including clustering and forecasting. Shows
+  production-ready patterns:
   auth, error handling, long-running queries, response-envelope
   unwrapping, and the Docker shape that operators actually run. Invoke
   whenever a user wants to "build on SynapCores", "use SynapCores from
@@ -16,18 +19,27 @@ description: >-
 
 # Build Production Apps on SynapCores AIDB
 
-> **Verified against:** engine **v1.14.0-ce** (current `:latest`), Python SDK
-> **0.5.0** (PyPI), Node SDK **0.6.1** (npm) — checked 2026-08-01 against a
-> **running v1.14.0-ce gateway** (route table + live MCP `tools/list`) and both
-> installed SDK packages. When a claim below is engine-version-gated, the version
-> is stated inline. (The two SDKs still trail the engine at 0.5.0 / 0.6.1 — new
-> v1.14 surface like native vision is REST-only until the SDKs catch up.)
+> **Verified against:** engine **v2.0-ce** (release candidate, merged v2.1 ML
+> line), Python SDK **0.5.0** (PyPI), Node SDK **0.6.1** (npm). Engine surface
+> re-checked **2026-10-08** on Linux against a running release artifact: the
+> transaction/FK gates (16/16 transport + crash harness), the shutdown signal
+> matrix, the v2.1 ML acceptance gate (36 checks) and a live MySQL→Parquet→S3
+> export. SDK claims are from the installed packages as of 2026-08-01.
+>
+> **The SDKs trail the engine badly.** They are at 0.5.0 / 0.6.1, which predates
+> *everything* in v2.0: durable transactions, enforced foreign keys, the data
+> lake, external tables, and the 19 new ML algorithm paths are **REST or SQL
+> only**. When in doubt, call `client.sql(...)` or plain REST rather than looking
+> for an SDK wrapper that does not exist yet.
 
 ## The mental model in one paragraph
 
 SynapCores is a **single-binary database** that speaks SQL but also gives you a
-graph engine (Cypher), NL→SQL translation, server-side transactions with
-savepoints, file/filesystem-backed RAG collections, recipe templates,
+graph engine (Cypher), NL→SQL translation, **crash-durable ACID transactions**
+with savepoints and **enforced foreign keys** (v2.0+), a **MySQL→Parquet→S3
+data lake** whose output you query in place as an external table (v1.16+),
+**AutoML over 32 algorithms** including clustering and time-series forecasting
+with drift-triggered retraining (v2.0/v2.1), file/filesystem-backed RAG collections, recipe templates,
 multimedia (audio/video/image/PDF) ingest, **native in-process image
 description** (`POST /v1/multimodal/describe` — LLaVA vision, no cloud or
 sidecar daemon, v1.14.0+), vector search (`EMBED`,
@@ -84,7 +96,9 @@ the Node SDK lacks is still reachable over plain REST (see the appendix).
   - Creating a key takes a **`permission`** field — `"ReadOnly"` or `"FullAccess"` — **not** `scopes`. The published OpenAPI has said `scopes`; the handler wants `permission`. `FullAccess` is equivalent to a JWT session.
   - Default admin user is `admin`; the bootstrap password is printed in the container/server logs on first boot.
 - **Response envelope:** the gateway wraps ALL success responses as `{data: ..., meta: {...}}`. Errors come as `{error: {code, message}, meta: {...}}`. **Always unwrap `body.data`** in raw HTTP clients. Both SDKs handle this automatically.
-- **Endpoints you'll hit constantly** (verified against the v1.14.0-ce route table — several differ from what you'd guess):
+- **Endpoints you'll hit constantly** (route table verified on v1.14.0-ce, with the
+  v1.16+ `/v1/lake/*` and v2.0 `/v1/transactions/*` routes confirmed on the v2.0-ce
+  artifact — several differ from what you'd guess):
 
   | Endpoint | Method | What it does |
   |---|---|---|
@@ -248,15 +262,97 @@ Node has no graph wrapper: `POST /v1/graph/match` with `{"sql": "<cypher>"}`.
 Mix freely — a Cypher MATCH followed by a regular `client.sql(...)` against the
 same customer table is one tenant scope, one connection.
 
-## Pattern 3 — Transactions with savepoints
+## Pattern 3 — Durable ACID transactions with savepoints (rewritten for v2.0)
+
+**What changed in v2.0, and why your old code may need a look.** Before v2.0 a
+`ROLLBACK` reversed your writes but could not survive a crash, and other
+connections could read uncommitted rows. Transactions now run on RocksDB's own
+transactional storage: a `COMMIT` that returns success has already reached the
+write-ahead log, so an acknowledged commit survives a hard kill and an
+unfinished transaction leaves nothing behind.
 
 ```python
-# Python — Tx is a context manager: commit on clean exit, rollback on exception.
-with client.transactions.begin(isolation_level="SERIALIZABLE") as tx:
+# Python. `SERIALIZABLE` is now REJECTED -- see the isolation note below.
+with client.transactions.begin(isolation_level="READ COMMITTED") as tx:
     tx.execute("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [100, "a"])
     tx.savepoint("after_debit")
     tx.execute("UPDATE accounts SET balance = balance + $1 WHERE id = $2", [100, "b"])
     # tx.rollback_to("after_debit") rolls back just the credit half.
+```
+
+**Four things that will bite you if you don't know them:**
+
+1. **`SERIALIZABLE` and `READ UNCOMMITTED` are rejected**, not silently
+   downgraded. Supported: `READ COMMITTED` (SQL/REST default) and
+   `REPEATABLE READ` (MySQL default). Older examples in this file and in the SDK
+   docs passed `SERIALIZABLE`; that now fails the request.
+
+2. **A bare `BEGIN` on `POST /v1/query/execute` returns HTTP 400**
+   (`transaction_session_required`). That endpoint has no session to attach a
+   transaction to. Use `POST /v1/transactions` → pass `transaction_id` on each
+   statement → `POST /v1/transactions/{id}/commit`, or use a MySQL connection.
+
+3. **Write conflicts are real and retryable.** Concurrent writers get HTTP 409
+   (`transaction_conflict`, `retryable: true`), or MySQL `1213` / SQLSTATE
+   `40001`. **Retry the whole transaction from a fresh `BEGIN`** — retrying only
+   the commit will not work. Validation tracks table epochs as well as row keys,
+   so two writes to *different rows of the same table* can still conflict. Code
+   that never saw a conflict before may start seeing them; that is the isolation
+   working.
+
+```python
+import time
+def transfer(client, src, dst, amount, attempts=5):
+    for attempt in range(attempts):
+        try:
+            with client.transactions.begin(isolation_level="READ COMMITTED") as tx:
+                tx.execute("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [amount, src])
+                tx.execute("UPDATE accounts SET balance = balance + $1 WHERE id = $2", [amount, dst])
+            return True
+        except Exception as e:                      # 409 / 40001 / 1213
+            if "40001" not in str(e) and "conflict" not in str(e).lower():
+                raise
+            time.sleep(0.05 * (2 ** attempt))       # fresh BEGIN on the next pass
+    return False
+```
+
+4. **Not everything participates.** Inside an *explicit* transaction, writes
+   touching enabled triggers, durable agent event bindings, AI/memory functions,
+   columnar or immutable tables, or lake reads are **refused** (HTTP 501) rather
+   than pretending to enrol. **Outside** a transaction they work normally — a
+   plain `INSERT ... EMBED(...)` or a write to a triggered table is fine, with
+   the hook firing after commit. So a trigger's side effect is not in the same
+   commit as its row: full ACID covers your rows and constraints, not hook
+   effects.
+
+**Enforced foreign keys (v2.0+).** `FOREIGN KEY` and table-level `UNIQUE` are
+now enforced, in single-column and composite form; earlier releases parsed and
+ignored them.
+
+```python
+client.sql("""
+  CREATE TABLE order_items (
+    id       INT PRIMARY KEY,
+    order_id INT,
+    FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+  )
+""")
+```
+
+`ON DELETE` / `ON UPDATE` accept `CASCADE`, `SET NULL`, `SET DEFAULT`,
+`RESTRICT`, `NO ACTION`. The referenced column must be a declared `PRIMARY KEY`
+or `UNIQUE` of matching type. Composite keys use `MATCH SIMPLE`, so a `NULL` in
+any part exempts the reference. Declare FKs in `CREATE TABLE` — adding one to an
+existing table, and cross-database FKs, are rejected.
+
+**If you are upgrading an existing database, audit first.** v2.0 rejects *new*
+violations but does not clean up rows that accumulated while the constraint was
+decoration:
+
+```sql
+SELECT COUNT(*) FROM orders o
+ WHERE o.customer_id IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id);
 ```
 
 Node has no transactions sub-client in 0.6.1 — drive `/v1/transactions/*` over
@@ -580,8 +676,8 @@ it gets the database tools as native function calls:
 }
 ```
 
-**Fourteen tools are registered** (v1.14.0-ce, confirmed from a live
-`tools/list`): `query`, `execute`, `validate_query`, `list_tables`,
+**Thirteen tools are registered** (counted in `tools/mod.rs` on the v2.0-ce
+artifact, 2026-10-08 — an older copy of this skill said fourteen): `query`, `execute`, `validate_query`, `list_tables`,
 `describe_table`, `sql_manual`, `graph_query`, `semantic_search`, `embed_text`,
 `generate_text`, `list_models`, `describe_model`, `train_model`, `predict`.
 
@@ -613,7 +709,9 @@ batch  = client.mcp.batch([
 info   = client.mcp.info()
 ```
 
-## Pattern 14 — AutoML (train + predict against your tables)
+## Pattern 14 — AutoML: 32 algorithms, trained from SQL (v2.0/v2.1)
+
+The SDK wrapper still works for the simple case:
 
 ```python
 job = client.automl.train(
@@ -625,8 +723,136 @@ model = client.automl.get_model(job["model_id"])
 preds = model.predict(rows=[{"arr": 80000, "tickets": 5, "nps": 4}])
 ```
 
-Or inline as SQL:
-`SELECT AUTOML_PREDICT('churn-model-v3', json_object('arr', arr, 'tickets', tickets)) FROM customers`.
+…but **everything added in v2.0/v2.1 is SQL or REST only**, so in practice you
+write SQL:
+
+```sql
+CREATE EXPERIMENT churn_v1 AS
+  SELECT tenure, monthly_charges, total_charges, churned
+    FROM customers
+WITH (task_type = 'binary_classification', target_column = 'churned',
+      algorithms = ['xgboost', 'logistic_regression'], max_trials = 20,
+      optimization_metric = 'auc', hyperparameter_strategy = 'bayesian');
+```
+
+The result is one TEXT column of JSON: `status`, `best_model_id`, `best_score`,
+`trials_attempted`, `failed_trials`, `score_basis`, `n_folds`,
+`refit_on_full_data`, `ignored_options`. **A misspelled option is refused, not
+ignored** — a typo fails loudly instead of quietly training something else.
+
+### The 32 algorithms, by task
+
+| task_type | algorithms |
+|---|---|
+| `regression` | `linear_regression` `ridge` `lasso` `elastic_net` `svr` `gaussian_process` `stacking` `blending` `xgboost` `catboost` `random_forest` `gradient_boosting` `lightgbm` `knn` `decision_tree` `extra_trees` `neural_network` |
+| `binary_classification` | `logistic_regression` `adaboost` `xgboost` `catboost` `random_forest` `gradient_boosting` `lightgbm` `svm` `naive_bayes` `decision_tree` `extra_trees` `neural_network` `knn` |
+| `multi_classification` | as binary, minus `logistic_regression` / `adaboost` (binary-only) and `lightgbm` |
+| `clustering` | `kmeans` `mini_batch_kmeans` `dbscan` `hierarchical` `gmm` |
+| `time_series` (aka `forecasting`) | `seasonal_naive` `ets` `arima` `sarima` `prophet` |
+| `anomaly_detection` | `isolation_forest` |
+
+**Task caveats worth reading before you pick one:** `logistic_regression` and
+`adaboost` are **binary-only**; `lightgbm` does regression and binary only; `svm`
+supports classification with at most **10 detected classes**. Asking for an
+unsupported pairing fails at training with a message naming the algorithm and
+task.
+
+**Metric allowlists are per task** — passing an out-of-task metric is refused:
+
+| task | metrics |
+|---|---|
+| regression | `r2` `mse` `rmse` `mae` `median_ae` `mape` `explained_variance` |
+| classification | `accuracy` `f1` `f1_macro` `f1_weighted` `precision` `recall` `auc` `log_loss` `cohen_kappa` `mcc` |
+| clustering | `silhouette` `davies_bouldin` |
+| time_series | `mae` `mse` `rmse` `smape` |
+| anomaly | `tail_separation` |
+
+### Clustering — no target column
+
+```sql
+CREATE EXPERIMENT segments_v1 AS
+  SELECT recency, frequency, monetary FROM customers
+WITH (task_type = 'clustering', algorithms = ['kmeans'],
+      n_clusters = 4, optimization_metric = 'silhouette');
+```
+
+**A clustering score is a silhouette or Davies-Bouldin value, not an accuracy** —
+do not present it as one. Cluster IDs are arbitrary integers; never attach
+meaning to the numbering. `dbscan` additionally labels noise points rather than
+forcing every row into a cluster.
+
+### Forecasting — one numeric series
+
+```sql
+CREATE EXPERIMENT sales_fc AS
+  SELECT ts, units FROM daily_sales ORDER BY ts
+WITH (task_type = 'forecasting', target_column = 'units',
+      algorithms = ['sarima'], time_column = 'ts', forecast_horizon = 12,
+      validation_strategy = 'walk_forward', seasonal_period = 12,
+      p = 1, d = 1, q = 0, seasonal_p = 0, seasonal_d = 1, seasonal_q = 0);
+```
+
+Per-family parameters: `seasonal_naive` takes `seasonal_period`; `ets` takes
+`seasonal_period`, `trend`, `seasonal`; `arima`/`sarima` take `p,d,q` (and
+`seasonal_p,seasonal_d,seasonal_q,seasonal_period`); `prophet` takes
+`seasonal_period`, `fourier_order`, `n_changepoints`.
+
+**Forecast selection scores are negated losses**, so a score of `-0.103` is a
+MAE of 0.103 and closer to zero is better. Validation is chronological
+(`walk_forward`), not a random split.
+
+### Queued and scheduled training
+
+```sql
+-- queue it; the connection returns immediately
+CREATE EXPERIMENT big_v1 AS SELECT ... WITH (..., async = true);
+
+-- or retrain on a UTC cron, persisted across restarts
+SELECT AUTOML.TRAIN('churn_model', 'SELECT ... FROM customers', 'churned')
+  WITH (schedule = '0 2 * * *');
+
+-- retrain only when the live feature distribution drifts -- no labels needed
+SELECT AUTOML.TRAIN('churn_model', 'SELECT ... FROM customers', 'churned')
+  WITH (retrain_on_drift = true, drift_baseline = 2.0);
+```
+
+`async = true` and `schedule` are **real as of v2.1** (earlier builds refused
+them). Jobs persist with their full configuration, tenant and named-database
+scope, and interrupted work resumes after a restart; delivery is at-least-once.
+Overlapping cron occurrences coalesce into one run. A bounded worker serialises
+fitting so training cannot starve API workers. Cancelling a *pending* job is
+durable; cancelling an *actively fitting* one returns HTTP 409 — native fitting
+is not interrupted mid-flight, so don't present cancellation as instant.
+
+Drift is a **max per-feature z-shift against the model's fitted scaler**, not
+PSI or KS. It needs no labels, and a model nothing has scored reports *no
+measurement* rather than zero drift.
+
+### Optional Optuna
+
+`hyperparameter_strategy = 'optuna'` uses the real upstream Optuna optimizer and
+**requires the Python package installed on the host**. Errors are explicit; there
+is no silent fallback to another strategy. The built-in strategies need no Python:
+`fixed_grid` (default), `random`, `bayesian`/`tpe` (a real TPE — give it 15+
+trials, since its first `max_trials/4` are a random warm-up), `grid`, and
+`halving`/`hyperband`.
+
+### Guardrails
+
+Synchronous training is capped at **500,000 rows** (raise with
+`max_training_rows`, or `AIDB_AUTOML_MAX_TRAINING_ROWS`) and a **10-minute**
+budget. Past that, use `AUTOML.TRAIN`, which queues.
+
+`DECIMAL` feature columns reach the model as exact values — before v2.0 they
+arrived as `NULL` and were mean-imputed, so money columns were invisible.
+
+Predict inline: `SELECT AUTOML_PREDICT('churn_v1', json_object('arr', arr))
+FROM customers`.
+
+> **Naming caution for docs and marketing:** `xgboost` and `catboost` are
+> **native compatible implementations**, not the upstream libraries, and
+> `prophet` is an additive model in the same spirit rather than Facebook's
+> package. Don't claim upstream runtimes or model-file interoperability.
 
 ## Pattern 15 — MySQL wire protocol (v1.11.0+)
 
@@ -703,6 +929,124 @@ print(r["data"])                      # remember: unwrap .data
 - **Fully local:** the image bytes never leave the box — ideal for regulated / air-gapped describe-and-extract (receipts, IDs, screenshots, chart reading).
 - Prefer an *external* vision model (e.g. GPT-4o vision)? Configure a provider at `PUT /v1/system/vision`; native describe needs no config.
 
+## Pattern 18 — Data lake: MySQL → Parquet → S3, then query it in place (v1.16+)
+
+Export an operational MySQL table to Parquet in your own object storage on a
+schedule, then register it as an ordinary SQL table and read it **without a load
+step**. Verified end-to-end on a release artifact.
+
+**Two config prerequisites, and the first one stops the lake dead:**
+
+```toml
+# gateway.toml
+[lake]
+enabled = true
+```
+
+```bash
+# 32-byte key used to encrypt stored destination secrets. Generate ONCE.
+export AIDB_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+```
+
+Without the key, `/v1/lake/*` returns **503** and the engine logs that it
+refuses to start the lake rather than storing your S3 secret unencrypted. For a
+throwaway dev box only, `AIDB_LAKE_ALLOW_DEV_KEY=1` uses a key published in the
+source tree.
+
+**The four-step flow** (all REST; no SDK wrapper exists):
+
+```bash
+# 1. the MySQL source. NOTE: the field is `database_name`, NOT `database`.
+curl -sS -X POST $AIDB/v1/data-sync/connections -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{
+    "name":"prod_mysql","connection_type":"mysql","host":"127.0.0.1","port":3306,
+    "database_name":"appdb","username":"readonly_etl","password":"'"$MYSQL_PASS"'"}'
+# -> {"id": "<CONN>", "status": "active"}
+
+# always prove reachability before building a job on it
+curl -sS -X POST $AIDB/v1/data-sync/connections/$CONN/test -H "Authorization: Bearer $TOKEN"
+# -> {"is_healthy": true, ...}
+
+# 2. the S3 destination. Drop endpoint/allow_http/path_style for real AWS.
+curl -sS -X POST $AIDB/v1/lake/destinations -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{
+    "name":"analytics","kind":"s3","bucket":"my-lake","prefix":"exports/orders",
+    "region":"us-east-1","endpoint":"http://127.0.0.1:9010",
+    "allow_http":true,"path_style":true,
+    "credentials":{"kind":"static","access_key_id":"KEY","secret_access_key":"'"$S3_SECRET"'"}}'
+
+# a real write/read/delete probe, not a ping -- four separate answers
+curl -sS -X POST $AIDB/v1/lake/destinations/$DEST/test -H "Authorization: Bearer $TOKEN"
+# -> {"reachable":true,"can_list":true,"can_write":true,"can_delete":true,...}
+
+# 3. the export job. `mode` is an OBJECT, not a string.
+curl -sS -X POST $AIDB/v1/lake/jobs -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' -d '{
+    "name":"orders_to_lake","source_connection_id":"'"$CONN"'",
+    "destination_id":"'"$DEST"'","schedule_cron":"0 3 * * *","enabled":true,
+    "tables":[{"source_table":"orders","lake_table":"orders_snap",
+               "mode":{"mode":"snapshot"},"columns":[],"order_by":["order_id"],
+               "promote":[],"transforms":[]}]}'
+
+# 4. run it; the response is a LIST, one run per table
+curl -sS -X POST $AIDB/v1/lake/jobs/$JOB/run -H "Authorization: Bearer $TOKEN"
+curl -sS $AIDB/v1/lake/runs/$RUN -H "Authorization: Bearer $TOKEN"
+# -> {"status":"succeeded","rows":8,"bytes":2247,"peak_rss_bytes":87183360,
+#     "child_exit_code":0,"error":null}
+```
+
+**`credentials.kind` is `static`, `ambient` or `none`.** Use `ambient` on EC2/EKS
+to pick up the instance role. The API **never returns the secret** — not the
+plaintext and not the ciphertext; you get `access_key_id` and
+`has_stored_secret: true`, which is enough to audit which key is in use.
+
+**Export modes:**
+
+| mode | writes | for |
+|---|---|---|
+| `{"mode":"snapshot"}` | a full copy per run under `snapshot_dt=YYYY-MM-DD` | mutable tables; removes all CDC complexity |
+| `{"mode":"incremental","partition_column":"created_at","granularity":"day"}` | only new rows under `dt=YYYY-MM-DD` | append-only facts |
+
+`"columns": []` resolves every column at run time, and if the source schema
+drifts from what was resolved the run **fails** rather than silently writing a
+different shape.
+
+**Then make it queryable and read it in place:**
+
+```bash
+curl -sS -X POST $AIDB/v1/lake/tables/orders_snap/register -H "Authorization: Bearer $TOKEN"
+# returns the exact CREATE EXTERNAL TABLE ... PARTITIONED BY (snapshot_dt DATE) it ran
+```
+
+```sql
+SHOW EXTERNAL TABLES;
+
+SELECT region, COUNT(*) AS orders, SUM(amount) AS revenue
+FROM orders_snap
+WHERE status = 'shipped'
+GROUP BY region ORDER BY revenue DESC;
+
+-- snapshot_dt is a real partition column: filtering it skips whole directories
+SELECT snapshot_dt, SUM(amount) FROM orders_snap GROUP BY snapshot_dt;
+```
+
+`DECIMAL` comes back **exact**, not as a float that has been through binary
+rounding. `DROP EXTERNAL TABLE` unregisters it and deletes **nothing** from your
+bucket.
+
+**Operational signals worth monitoring:** `/v1/lake/tables` reports
+`verified_partitions` alongside `partitions` — equal means every file the run
+claimed was read back and confirmed. `peak_rss_bytes` and `child_exit_code` exist
+because the export runs as a **child process** with its own memory budget, so a
+large table cannot take the database down, and a child that dies is a failed run
+rather than a truncated file.
+
+**Performance, measured on Linux against DuckDB 1.5.5 reading the same objects**
+(server-side both sides, answers compared row by row): a 189,361-row scan is
+2.8× faster, a join count 2.0×, a 176,400-row join 1.8× — and a `GROUP BY` on a
+text column is **1.3× slower**. Don't claim a blanket win; scans and joins are
+where it wins.
+
 ## Production checklist
 
 ### Authentication
@@ -740,7 +1084,7 @@ print(r["data"])                      # remember: unwrap .data
 - [ ] Don't query across tenants from app code; use the per-tenant container.
 
 ### Docker shape for production
-- [ ] `synapcores/community:v1.14.0-ce` — **pin the version**, don't use `:latest`.
+- [ ] `synapcores/community:v2.0.0-ce` — **pin the version**, don't use `:latest`.
 - [ ] Mount `gateway.toml` read-only at `/etc/synapcores/gateway.toml`.
 - [ ] Mount the data volume at `/var/lib/synapcores` — persistent.
 - [ ] `AIDB_ACCEPT_LICENSE=1`, `AIDB_JWT_SECRET=<32-byte-secret>`, `RUST_LOG=info`.
@@ -751,13 +1095,13 @@ print(r["data"])                      # remember: unwrap .data
 
 ## Common gotchas
 
-**Fixed since the v1.13.0-ce era** — older copies of this skill warned about these; they're **resolved on v1.14.0-ce** (verified live), so you can stop working around them:
+**Fixed in earlier releases** — older copies of this skill warned about these; they were **resolved by v1.14.0-ce** (verified live then), so you can stop working around them:
 
 - `SELECT DISTINCT` and `COUNT(DISTINCT ...)` now dedupe correctly (fixed v1.13.0.1).
 - The blanket "named (non-default) database drops `WHERE` matches" no-op is fixed (v1.13.0.1) — filtered `SELECT` / `DELETE` / `UPDATE` work on named databases.
 - The FFmpeg mismatch on Debian 12 / Ubuntu 24.04 is handled: release tarballs are now **distro-specific** (the `…-ubuntu24` build links FFmpeg 6). Use the installer or the Docker image and you won't hit it — only a *mismatched bare tarball* on the wrong distro fails.
 
-**Still open against v1.14.0-ce (2026-08-01)** — re-check on your build:
+**Were open on v1.14.0-ce (2026-08-01)** — several have since been fixed (the cross-DB index-isolation bug landed in v1.17.0-ce, and `ROLLBACK`/`BACKUP` in v1.18.0-ce). Re-check each against your build rather than assuming:
 
 1. **Cross-database index isolation edge.** If you run **multiple named databases** with **same-named tables whose primary keys overlap**, a PK-index lookup can occasionally resolve against the wrong database (load-dependent; full-table scans are unaffected). **The safe shapes never hit this:** one database per deployment (the default), or — if you must run several named DBs — give the tables distinct names or non-overlapping PK ranges.
 
